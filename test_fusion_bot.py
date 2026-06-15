@@ -187,6 +187,56 @@ def test_usable_tool_response_predicate():
     print("PASS test_usable_tool_response_predicate")
 
 
+def test_streaming_fusion_returns_sse():
+    """stream=true must return an SSE stream (text/event-stream), not a JSON body.
+
+    A JSON body reads as an empty response to streaming clients (the Hermes agent),
+    which was the real cause of 'Empty response from model'.
+    """
+    from fastapi.testclient import TestClient
+    fb.call_upstream = fake_call
+    with TestClient(fb.app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={"model": "fusion", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+    assert r.status_code == 200, (r.status_code, r.text)
+    assert r.headers["content-type"].startswith("text/event-stream"), r.headers.get("content-type")
+    body = r.text
+    assert "chat.completion.chunk" in body, body
+    assert "FUSED:" in body, body              # the computed answer rides in a delta
+    assert "data: [DONE]" in body, body
+    print("PASS test_streaming_fusion_returns_sse")
+
+
+def test_streaming_tool_calls_sse():
+    """Tool passthrough under stream=true must emit tool_calls deltas with an index."""
+    from fastapi.testclient import TestClient
+
+    async def fake_raw(client, model, messages, extra, sem, retries=2):
+        return {"choices": [{"index": 0, "finish_reason": "tool_calls",
+                             "message": {"role": "assistant", "content": None,
+                                         "tool_calls": [{"id": "c1", "type": "function",
+                                                         "function": {"name": "get_weather", "arguments": "{}"}}]}}]}
+
+    fb.call_upstream_raw = fake_raw
+    with TestClient(fb.app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={"model": "fusion", "messages": [{"role": "user", "content": "hi"}],
+                  "tools": [{"type": "function", "function": {"name": "get_weather"}}], "stream": True},
+        )
+    assert r.status_code == 200, (r.status_code, r.text)
+    assert r.headers["content-type"].startswith("text/event-stream"), r.headers.get("content-type")
+    body = r.text
+    assert "tool_calls" in body and "get_weather" in body, body
+    assert '"index": 0' in body, body
+    assert "data: [DONE]" in body, body
+    print("PASS test_streaming_tool_calls_sse")
+
+
 if __name__ == "__main__":
     test_fuse_synthesizes()
     test_fuse_judge_fallback()
@@ -195,4 +245,6 @@ if __name__ == "__main__":
     test_tools_passthrough_returns_tool_calls_and_skips_fusion()
     test_tools_passthrough_skips_garbage_and_falls_through()
     test_usable_tool_response_predicate()
+    test_streaming_fusion_returns_sse()
+    test_streaming_tool_calls_sse()
     print("\nALL TESTS PASSED")

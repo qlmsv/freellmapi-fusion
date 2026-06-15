@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -274,6 +275,36 @@ def _openai_response(text):
     }
 
 
+def _stream_chunk(delta, finish, cid, created):
+    return {
+        "id": cid, "object": "chat.completion.chunk", "created": created,
+        "model": FUSION_MODEL_NAME,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+
+
+def _sse_stream(message, finish_reason):
+    """Emit an OpenAI-compatible SSE stream for an already-computed assistant message.
+
+    Fusion computes the whole answer up front (panel/judge synthesis, or upstream
+    passthrough), so this replays it as one role+content/tool_calls delta followed
+    by a terminal finish chunk and [DONE]. Streaming clients (e.g. the Hermes agent,
+    which always sends stream=true) require this SSE shape — a plain JSON body reads
+    as an empty response to them.
+    """
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    delta = {"role": "assistant"}
+    content = message.get("content")
+    if content is not None:
+        delta["content"] = content
+    if message.get("tool_calls"):
+        delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(message["tool_calls"])]
+    yield f"data: {json.dumps(_stream_chunk(delta, None, cid, created))}\n\n"
+    yield f"data: {json.dumps(_stream_chunk({}, finish_reason or 'stop', cid, created))}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 async def require_fusion_key(authorization: str = Header(default="")):
     """Bearer auth against FUSION_API_KEY."""
     token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else authorization.strip()
@@ -329,26 +360,34 @@ async def chat_completions(req: ChatRequest, _=Depends(require_fusion_key)):
         if req.temperature is not None:
             extra["temperature"] = req.temperature
         fwd_messages = _passthrough_messages(req.messages)
-        last = None
+        chosen = None  # last structurally-valid response (best-effort fallback)
         for tm in TOOL_MODELS:
             raw = await call_upstream_raw(app.state.client, tm, fwd_messages, extra, app.state.sem)
             if raw and raw.get("choices"):
-                last = raw
+                chosen = raw
             if _usable_tool_response(raw):
-                raw["model"] = FUSION_MODEL_NAME
-                return raw
-        # Every candidate failed the usability check — return the last structurally
-        # valid response as a best effort rather than hard-failing the agent turn.
-        if last:
-            last["model"] = FUSION_MODEL_NAME
-            return last
-        raise HTTPException(status_code=502, detail="All tool-capable models failed to respond.")
+                break
+        if not chosen:
+            raise HTTPException(status_code=502, detail="All tool-capable models failed to respond.")
+        choice = chosen["choices"][0]
+        if req.stream:
+            return StreamingResponse(
+                _sse_stream(choice.get("message") or {}, choice.get("finish_reason") or "stop"),
+                media_type="text/event-stream",
+            )
+        chosen["model"] = FUSION_MODEL_NAME
+        return chosen
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     try:
         text = await fuse(app.state.client, messages, app.state.sem)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+    if req.stream:
+        return StreamingResponse(
+            _sse_stream({"role": "assistant", "content": text}, "stop"),
+            media_type="text/event-stream",
+        )
     return _openai_response(text)
 
 
