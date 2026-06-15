@@ -147,10 +147,52 @@ def test_tools_passthrough_returns_tool_calls_and_skips_fusion():
     print("PASS test_tools_passthrough_returns_tool_calls_and_skips_fusion")
 
 
+def test_tools_passthrough_skips_garbage_and_falls_through():
+    """A finish_reason='length' response with no tool_calls is garbage -> try next model."""
+    from fastapi.testclient import TestClient
+    used = []
+
+    async def fake_raw(client, model, messages, extra, sem, retries=2):
+        used.append(model)
+        if model == fb.TOOL_MODELS[0]:
+            # garbage: rambled to max_tokens, no tool_calls
+            return {"choices": [{"index": 0, "finish_reason": "length",
+                                 "message": {"role": "assistant", "content": "随处可见 garbage \n ]["}}]}
+        return {"choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "Paris is 22C and sunny."}}]}
+
+    fb.call_upstream_raw = fake_raw
+    with TestClient(fb.app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={"model": "fusion",
+                  "messages": [{"role": "user", "content": "weather?"}],
+                  "tools": [{"type": "function", "function": {"name": "get_weather"}}]},
+        )
+    assert r.status_code == 200, (r.status_code, r.text)
+    body = r.json()
+    assert body["choices"][0]["message"]["content"] == "Paris is 22C and sunny.", body
+    assert used == fb.TOOL_MODELS[:2], used  # skipped #1 (garbage), used #2
+    print("PASS test_tools_passthrough_skips_garbage_and_falls_through")
+
+
+def test_usable_tool_response_predicate():
+    assert fb._usable_tool_response({"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}]})
+    assert fb._usable_tool_response({"choices": [{"finish_reason": "tool_calls",
+                                                  "message": {"tool_calls": [{"id": "x"}]}}]})
+    assert not fb._usable_tool_response({"choices": [{"finish_reason": "length", "message": {"content": "ramble"}}]})
+    assert not fb._usable_tool_response({"choices": [{"finish_reason": "stop", "message": {"content": "  "}}]})
+    assert not fb._usable_tool_response(None)
+    print("PASS test_usable_tool_response_predicate")
+
+
 if __name__ == "__main__":
     test_fuse_synthesizes()
     test_fuse_judge_fallback()
     test_all_panel_dead_falls_back_to_judge_alone()
     test_http_endpoint_and_auth()
     test_tools_passthrough_returns_tool_calls_and_skips_fusion()
+    test_tools_passthrough_skips_garbage_and_falls_through()
+    test_usable_tool_response_predicate()
     print("\nALL TESTS PASSED")

@@ -52,9 +52,14 @@ PANEL_MODELS = [m.strip() for m in os.environ.get("PANEL_MODELS", "").split(",")
 JUDGE_MODELS = [m.strip() for m in os.environ.get("JUDGE_MODEL", "").split(",") if m.strip()]
 # Tool-calling fallback chain. Fusion synthesizes prose and cannot emit tool_calls,
 # so requests carrying `tools` are routed to a single tool-capable upstream instead.
+# Verified to emit tool_calls on turn 1 AND a clean answer on the tool-result turn.
+# NOTE: OpenRouter ":free" routes (mistral-large-3, llama-3.3-70b:free, qwen3-coder:free,
+# deepseek-v4-pro) and kimi-k2.6 mishandle the tool-result turn — they ramble until
+# max_tokens (finish_reason="length") producing garbage. Dedicated provider routes
+# (Groq versatile, NVIDIA, gpt-oss) handle both turns cleanly.
 TOOL_MODELS = [m.strip() for m in os.environ.get(
     "TOOL_MODELS",
-    "mistralai/mistral-large-3-675b-instruct-2512,meta-llama/llama-3.3-70b-instruct:free,openai/gpt-oss-120b:free",
+    "llama-3.3-70b-versatile,openai/gpt-oss-120b:free,meta/llama-3.3-70b-instruct",
 ).split(",") if m.strip()]
 FUSION_API_KEY = os.environ.get("FUSION_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -215,6 +220,27 @@ class ChatRequest(BaseModel):
     stream: Optional[bool] = None
 
 
+def _usable_tool_response(raw):
+    """True if a raw upstream response is a usable agent turn.
+
+    Rejects empty content and the 'rambles until max_tokens' failure mode
+    (finish_reason='length' with no tool_calls) that some upstreams hit on the
+    tool-result turn — so the passthrough chain falls through to the next model.
+    """
+    if not raw or not raw.get("choices"):
+        return False
+    ch = raw["choices"][0]
+    msg = ch.get("message") or {}
+    if msg.get("tool_calls"):
+        return True
+    content = (msg.get("content") or "").strip()
+    if not content:
+        return False
+    if ch.get("finish_reason") == "length":
+        return False
+    return True
+
+
 def _passthrough_messages(messages):
     """Rebuild messages preserving tool-calling fields for raw upstream forwarding."""
     out = []
@@ -303,11 +329,19 @@ async def chat_completions(req: ChatRequest, _=Depends(require_fusion_key)):
         if req.temperature is not None:
             extra["temperature"] = req.temperature
         fwd_messages = _passthrough_messages(req.messages)
+        last = None
         for tm in TOOL_MODELS:
             raw = await call_upstream_raw(app.state.client, tm, fwd_messages, extra, app.state.sem)
             if raw and raw.get("choices"):
+                last = raw
+            if _usable_tool_response(raw):
                 raw["model"] = FUSION_MODEL_NAME
                 return raw
+        # Every candidate failed the usability check — return the last structurally
+        # valid response as a best effort rather than hard-failing the agent turn.
+        if last:
+            last["model"] = FUSION_MODEL_NAME
+            return last
         raise HTTPException(status_code=502, detail="All tool-capable models failed to respond.")
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
