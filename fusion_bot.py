@@ -17,6 +17,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -49,6 +50,12 @@ UPSTREAM_BASE_URL = os.environ.get("UPSTREAM_BASE_URL", "").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "")
 PANEL_MODELS = [m.strip() for m in os.environ.get("PANEL_MODELS", "").split(",") if m.strip()]
 JUDGE_MODELS = [m.strip() for m in os.environ.get("JUDGE_MODEL", "").split(",") if m.strip()]
+# Tool-calling fallback chain. Fusion synthesizes prose and cannot emit tool_calls,
+# so requests carrying `tools` are routed to a single tool-capable upstream instead.
+TOOL_MODELS = [m.strip() for m in os.environ.get(
+    "TOOL_MODELS",
+    "mistralai/mistral-large-3-675b-instruct-2512,meta-llama/llama-3.3-70b-instruct:free,openai/gpt-oss-120b:free",
+).split(",") if m.strip()]
 FUSION_API_KEY = os.environ.get("FUSION_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ALLOWED_USER_IDS = {
@@ -123,6 +130,33 @@ async def call_upstream(client, model, messages, sem, retries=UPSTREAM_RETRIES):
                 return None
 
 
+async def call_upstream_raw(client, model, messages, extra, sem, retries=UPSTREAM_RETRIES):
+    """Forward a full OpenAI request to one upstream; return raw JSON (with tool_calls) or None.
+
+    Unlike call_upstream (which extracts text for fusion), this preserves the
+    complete response so tool_calls / finish_reason pass through to the caller.
+    """
+    payload = {"model": model, "messages": messages, "stream": False, **extra}
+    headers = {"Authorization": f"Bearer {UPSTREAM_API_KEY}", "Content-Type": "application/json"}
+    async with sem:
+        for attempt in range(retries + 1):
+            try:
+                r = await client.post(
+                    f"{UPSTREAM_BASE_URL}/chat/completions",
+                    json=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+                )
+                if r.status_code == RATE_LIMIT_STATUS and attempt < retries:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                if attempt < retries:
+                    await asyncio.sleep(attempt + 1)
+                    continue
+                return None
+
+
 async def fuse(client, messages, sem):
     """Fan out to PANEL_MODELS, then synthesize via the JUDGE fallback chain.
 
@@ -166,12 +200,36 @@ async def fuse(client, messages, sem):
 
 class ChatMessage(BaseModel):
     role: str
-    content: object  # str, or OpenAI content-parts list
+    content: object = None  # str, OpenAI content-parts list, or None on tool/assistant-call turns
+    name: Optional[str] = None
+    tool_calls: Optional[Any] = None      # assistant turn requesting tool calls
+    tool_call_id: Optional[str] = None    # tool result turn
 
 
 class ChatRequest(BaseModel):
     model: str = FUSION_MODEL_NAME
     messages: list[ChatMessage]
+    tools: Optional[Any] = None
+    tool_choice: Optional[Any] = None
+    temperature: Optional[float] = None
+    stream: Optional[bool] = None
+
+
+def _passthrough_messages(messages):
+    """Rebuild messages preserving tool-calling fields for raw upstream forwarding."""
+    out = []
+    for m in messages:
+        d = {"role": m.role}
+        if m.content is not None:
+            d["content"] = m.content
+        if m.name is not None:
+            d["name"] = m.name
+        if m.tool_calls is not None:
+            d["tool_calls"] = m.tool_calls
+        if m.tool_call_id is not None:
+            d["tool_call_id"] = m.tool_call_id
+        out.append(d)
+    return out
 
 
 def _openai_response(text):
@@ -220,7 +278,7 @@ app = FastAPI(title="FreeLLMAPI Fusion", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "panel": PANEL_MODELS, "judges": JUDGE_MODELS}
+    return {"status": "ok", "panel": PANEL_MODELS, "judges": JUDGE_MODELS, "tools": TOOL_MODELS}
 
 
 @app.get("/v1/models")
@@ -234,6 +292,24 @@ async def list_models(_=Depends(require_fusion_key)):
 async def chat_completions(req: ChatRequest, _=Depends(require_fusion_key)):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages must not be empty")
+
+    # Tool-calling passthrough: fusion synthesizes prose and cannot emit tool_calls.
+    # When the caller supplies `tools`, route to one tool-capable upstream and return
+    # its raw response (preserving tool_calls / finish_reason) instead of fusing.
+    if req.tools:
+        extra = {"tools": req.tools}
+        if req.tool_choice is not None:
+            extra["tool_choice"] = req.tool_choice
+        if req.temperature is not None:
+            extra["temperature"] = req.temperature
+        fwd_messages = _passthrough_messages(req.messages)
+        for tm in TOOL_MODELS:
+            raw = await call_upstream_raw(app.state.client, tm, fwd_messages, extra, app.state.sem)
+            if raw and raw.get("choices"):
+                raw["model"] = FUSION_MODEL_NAME
+                return raw
+        raise HTTPException(status_code=502, detail="All tool-capable models failed to respond.")
+
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     try:
         text = await fuse(app.state.client, messages, app.state.sem)

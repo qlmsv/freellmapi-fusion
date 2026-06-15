@@ -85,9 +85,72 @@ def test_http_endpoint_and_auth():
     print("PASS test_http_endpoint_and_auth")
 
 
+def test_tools_passthrough_returns_tool_calls_and_skips_fusion():
+    """A request carrying `tools` must bypass fuse() and forward raw to a tool model."""
+    from fastapi.testclient import TestClient
+    seen = {}
+
+    async def fake_raw(client, model, messages, extra, sem, retries=2):
+        seen["model"] = model
+        seen["messages"] = messages
+        seen["extra"] = extra
+        return {
+            "id": "x", "object": "chat.completion", "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": None,
+                            "tool_calls": [{"id": "c1", "type": "function",
+                                            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]},
+                "finish_reason": "tool_calls",
+            }],
+        }
+
+    async def must_not_run(*a, **k):
+        raise AssertionError("fuse() must not be called when tools are present")
+
+    fb.call_upstream_raw = fake_raw
+    orig_fuse = fb.fuse
+    fb.fuse = must_not_run
+    try:
+        with TestClient(fb.app) as client:
+            r = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer secret"},
+                json={
+                    "model": "fusion",
+                    "messages": [
+                        {"role": "user", "content": "weather in Paris?"},
+                        {"role": "assistant", "content": None,
+                         "tool_calls": [{"id": "c0", "type": "function",
+                                         "function": {"name": "x", "arguments": "{}"}}]},
+                        {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
+                    ],
+                    "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                    "tool_choice": "auto",
+                },
+            )
+        assert r.status_code == 200, (r.status_code, r.text)
+        body = r.json()
+        assert body["choices"][0]["finish_reason"] == "tool_calls", body
+        assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather", body
+        assert body["model"] == "fusion", body
+        # first model in the TOOL_MODELS chain was used
+        assert seen["model"] == fb.TOOL_MODELS[0], seen["model"]
+        # tools + tool_choice were forwarded
+        assert seen["extra"].get("tools") and seen["extra"].get("tool_choice") == "auto", seen["extra"]
+        # tool history fields preserved (assistant.tool_calls + tool.tool_call_id)
+        roles = [m["role"] for m in seen["messages"]]
+        assert roles == ["user", "assistant", "tool"], roles
+        assert seen["messages"][1].get("tool_calls"), "assistant tool_calls dropped"
+        assert seen["messages"][2].get("tool_call_id") == "c0", "tool_call_id dropped"
+    finally:
+        fb.fuse = orig_fuse
+    print("PASS test_tools_passthrough_returns_tool_calls_and_skips_fusion")
+
+
 if __name__ == "__main__":
     test_fuse_synthesizes()
     test_fuse_judge_fallback()
     test_all_panel_dead_falls_back_to_judge_alone()
     test_http_endpoint_and_auth()
+    test_tools_passthrough_returns_tool_calls_and_skips_fusion()
     print("\nALL TESTS PASSED")
