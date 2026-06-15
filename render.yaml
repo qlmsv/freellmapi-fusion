@@ -15,10 +15,12 @@ services:
         value: "8000"
       - key: UPSTREAM_BASE_URL
         value: https://freellmapi-rf2v.onrender.com/v1
+      # Panel: diverse, fast (<3s), verified non-empty on the upstream gateway.
       - key: PANEL_MODELS
-        value: qwen/qwen3-32b,gemma4:31b,@cf/nvidia/nemotron-3-120b-a12b,deepseek-ai/deepseek-v4-flash
+        value: gemma4:31b,meta-llama/llama-3.3-70b-instruct:free,openai/gpt-oss-120b:free,mistralai/mistral-large-3-675b-instruct-2512
+      # Judges: synthesizers that emit clean prose (no leaked reasoning), fast fallback chain.
       - key: JUDGE_MODEL
-        value: "@cf/moonshotai/kimi-k2.6,@cf/zai-org/glm-4.7-flash,meta-llama/llama-3.3-70b-instruct:free"
+        value: "mistralai/mistral-large-3-675b-instruct-2512,@cf/moonshotai/kimi-k2.6,meta-llama/llama-3.3-70b-instruct:free"
       - key: MAX_CONCURRENCY
         value: "4"
       - key: REQUEST_TIMEOUT
