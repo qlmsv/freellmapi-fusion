@@ -1,0 +1,6 @@
+venv/
+.env
+.env.fusion
+__pycache__/
+*.pyc
+bench_results/

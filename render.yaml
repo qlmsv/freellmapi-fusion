@@ -1,0 +1,34 @@
+# Render Blueprint — Fusion layer (OpenAI-compatible API + Telegram bot, one process).
+# The FreeLLMAPI gateway is a separate, already-deployed service.
+services:
+  - type: web
+    name: fusion-api
+    runtime: python
+    plan: starter            # always-on (free tier sleeps and would kill the Telegram long-poll)
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python fusion_bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: UPSTREAM_BASE_URL
+        value: https://freellmapi-rf2v.onrender.com/v1
+      - key: PANEL_MODELS
+        value: qwen/qwen3-32b,gemma4:31b,@cf/nvidia/nemotron-3-120b-a12b,deepseek-ai/deepseek-v4-flash
+      - key: JUDGE_MODEL
+        value: "@cf/moonshotai/kimi-k2.6,@cf/zai-org/glm-4.7-flash,meta-llama/llama-3.3-70b-instruct:free"
+      - key: MAX_CONCURRENCY
+        value: "4"
+      - key: REQUEST_TIMEOUT
+        value: "120"
+      # Secrets — set in the Render dashboard / via API, NOT committed:
+      - key: UPSTREAM_API_KEY
+        sync: false
+      - key: FUSION_API_KEY
+        sync: false
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
